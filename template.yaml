@@ -1,0 +1,297 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Generic CloudFormation project_1 template.
+  Deploys a S3 bucket, DynamoDB table,Lambda function, CloudFormation.
+  Used to demonstrate CloudFormation mechanics.
+
+Resources:
+
+  
+  # S3 BUCKET (STATIC SITE)
+  
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: emanuele-bucket-web-047719652891
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Owner
+          Value: Emanuele
+        - Key: Project
+          Value: project1
+
+  
+  # CLOUDFRONT OAC
+  
+  MyOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: emanuele-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+ 
+  
+  # DYNAMODB
+  
+  ContactTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: contact
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: email
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: email
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      Tags:
+        - Key: Owner
+          Value: Emanuele
+        - Key: Project
+          Value: project1
+
+  
+  # IAM ROLE FOR LAMBDA
+  # il nome ruolo deve inziare obbligatorio: Emanuele- 
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: Emanuele-artisana-lambda-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: dynamodb-write
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt ContactTable.Arn   #arn del database
+        - PolicyName: logs
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+      Tags:
+        - Key: Owner
+          Value: Emanuele
+        - Key: Project
+          Value: project1
+
+ 
+  # LAMBDA
+  
+  ContactLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: emanuele-contact-api
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ContactTable   # nome tabella DynamoDB
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+          import os
+
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TABLE_NAME"])
+
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event.get("body") or "{}")
+
+                  email = body.get("email")
+                  name = body.get("name", "")
+                  message = body.get("message")
+
+                  if not email or not message:
+                      return response(400, {"ok": False, "error": "Missing fields"})
+
+                  table.put_item(
+                      Item={
+                          "email": email,
+                          "timestamp": datetime.utcnow().isoformat(),
+                          "name": name,
+                          "message": message
+                      }
+                  )
+
+                  return response(200, {"ok": True})
+
+              except Exception as e:
+                  return response(500, {"ok": False, "error": str(e)})
+
+          def response(status, body):
+              return {
+                  "statusCode": status,
+                  "headers": {
+                      "Access-Control-Allow-Origin": "*",
+                      "Access-Control-Allow-Headers": "*",
+                      "Access-Control-Allow-Methods": "POST"
+                  },
+                  "body": json.dumps(body)
+              }
+
+      Tags:
+        - Key: Owner
+          Value: Emanuele
+        - Key: Project
+          Value: project1
+
+  
+  # LAMBDA FUNCTION URL
+  
+  LambdaFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ContactLambda.Arn
+      AuthType: NONE
+      Cors:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - POST
+        AllowHeaders:
+          - "*"
+  
+  # PERMISSION PUBLIC URL
+  LambdaPermissionUrl:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ContactLambda
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+  
+  LambdaPermissionInvoke:
+   Type: AWS::Lambda::Permission
+   Properties:
+    FunctionName: !Ref ContactLambda
+    Action: lambda:InvokeFunction
+    Principal: "*"
+
+  #-----CLOUD FRONT ---------
+
+  CloudFrontDistribution:
+   Type: AWS::CloudFront::Distribution
+   Properties:
+    DistributionConfig:
+      Enabled: true
+      DefaultRootObject: home_page.html
+
+      Origins:
+        
+        # S3 ORIGIN (STATIC SITE)
+        
+        - Id: S3Origin
+          DomainName: !GetAtt WebBucket.RegionalDomainName
+          S3OriginConfig: {}
+          OriginAccessControlId: !Ref MyOAC
+
+        
+        # LAMBDA FUNCTION URL ORIGIN
+        
+        - Id: LambdaOrigin
+          DomainName: !Select
+            - 2
+            - !Split
+              - "/"
+              - !GetAtt LambdaFunctionUrl.FunctionUrl
+          CustomOriginConfig:
+            OriginProtocolPolicy: https-only
+
+     
+      # CACHE BEHAVOIR S3 (STATIC FILES WEB )
+      # /*
+      DefaultCacheBehavior:
+        TargetOriginId: S3Origin
+        ViewerProtocolPolicy: redirect-to-https
+
+        AllowedMethods:
+          - GET
+          - HEAD
+
+        CachedMethods:
+          - GET
+          - HEAD
+
+        # AWS Managed: CachingOptimized  ----aws usa codici ID fissi per configurare risorse tramite template.
+        CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        
+
+      
+      # /api/* LAMBDA fuction URL
+      
+      CacheBehaviors:
+        - PathPattern: /api/*
+          TargetOriginId: LambdaOrigin
+          ViewerProtocolPolicy: https-only
+
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - POST
+            - PUT
+            - PATCH
+            - DELETE
+
+          CachedMethods:
+            - GET
+            - HEAD
+
+          # AWS Managed: CachingDisabled 
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad 
+          
+          # verificare codice non id per allViewerexceptionHOstHeader 
+          #errato id ---> OriginRequestPolicyId: b689b0a8-53d0-40ab-bdf2-68038e1b9b1e
+        
+
+          
+
+  
+  # ---------------- BUCKET POLICY per OAC---------------
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${WebBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  
+  # OUTPUT  ---> url del site web
+  
+Outputs:
+  WebsiteURL:
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
